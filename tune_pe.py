@@ -64,18 +64,32 @@ def main():
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--accum", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--device", default=None,
+                    help="default: cuda if available else mps if available else cpu")
+    ap.add_argument("--ckpt-every", type=int, default=100,
+                    help="save resume checkpoint every N steps (crash-safe)")
+    ap.add_argument("--resume", default=None,
+                    help="resume from a step checkpoint dir")
     args = ap.parse_args()
     torch.manual_seed(args.seed)
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    print("device:", dev, flush=True)
+    if args.device:
+        dev = args.device
+    else:
+        dev = ("cuda" if torch.cuda.is_available()
+               else "mps" if torch.backends.mps.is_available() else "cpu")
+    use_amp = (dev == "cuda")
+    print("device:", dev, "amp:", use_amp, flush=True)
 
     from transformers import AutoModel, AutoProcessor
     model = AutoModel.from_pretrained(args.model, trust_remote_code=True,
-                                      torch_dtype=torch.bfloat16).to(dev)
+                                      torch_dtype=torch.float32).to(dev)
     proc = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
 
-    # freeze towers; train heads + scales + projs only
-    train_sub = ("head", "proj", "logit", "data_proj", "norm")
+    # freeze towers; train heads + scales + projs only.
+    # NOTE: 'norm' deliberately NOT trainable — tower LayerNorms matching it
+    # would force full-graph backward (all activations retained) and OOM/swap
+    # the machine. Heads-only keeps backward inside the head subgraph.
+    train_sub = ("head", "proj", "logit_scale", "logit_bias", "data_proj")
     n_train, n_frozen = 0, 0
     for name, p in model.named_parameters():
         if any(s in name for s in train_sub):
@@ -87,7 +101,23 @@ def main():
     print(f"trainable {n_train/1e6:.1f}M / frozen {n_frozen/1e6:.1f}M", flush=True)
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
                             lr=args.lr)
-    scaler = torch.amp.GradScaler("cuda", enabled=(dev == "cuda"))
+    if use_amp:
+        scaler = torch.amp.GradScaler("cuda")
+    if args.resume and os.path.exists(os.path.join(args.resume, "opt.pt")):
+        # NOTE: raw load_state_dict silently no-ops on PeAudioVideoModel's
+        # dual-prefix layout (verified) — restore via copy_ by param name.
+        ck = torch.load(os.path.join(args.resume, "model_ckpt.pt"),
+                        map_location=dev, weights_only=True)
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                if name in ck and tuple(ck[name].shape) == tuple(p.shape):
+                    p.copy_(ck[name])
+        opt.load_state_dict(torch.load(os.path.join(args.resume, "opt.pt"),
+                                       map_location=dev, weights_only=True))
+        start_step = int(open(os.path.join(args.resume, "step.txt")).read())
+        print(f"resumed at step {start_step}", flush=True)
+    else:
+        start_step = 0
 
     import numpy as np
     from PIL import Image
@@ -129,25 +159,53 @@ def main():
             chunk = [coco[j] for j in order[i:i + args.batch]]
             frames = [np.array(Image.open(p).convert("RGB")) for p, _ in chunk]
             texts = [c for _, c in chunk]
-            inp = proc(videos=[[f] for f in frames], text=texts,
-                       return_tensors="pt")
+            pv = proc(videos=[[f] for f in frames],
+                      return_tensors="pt")["pixel_values_videos"]
+            t = proc.tokenizer(texts, return_tensors="pt", padding=True,
+                               truncation=True)
+            aw = proc(audio=[np.zeros(48000, dtype=np.float32)] * len(chunk),
+                      sampling_rate=48000, return_tensors="pt")
+            iv = aw["input_values"]
+            if iv.dim() == 2:
+                iv = iv.unsqueeze(1)
+            inp = {"pixel_values_videos": pv, "input_ids": t["input_ids"],
+                   "attention_mask": t.get("attention_mask"),
+                   "input_values": iv,
+                   "padding_mask": torch.ones((len(chunk), iv.shape[-1]),
+                                              dtype=torch.int32)}
             inp = {k: (v.to(dev) if hasattr(v, "to") else v)
                    for k, v in inp.items()}
             with torch.autocast(dev, dtype=torch.bfloat16,
-                                enabled=(dev == "cuda")):
+                                enabled=use_amp):
                 o = model(**{k: v for k, v in inp.items()
                               if k in ("input_ids", "attention_mask",
                                        "pixel_values_videos", "input_values",
                                        "padding_mask")})
                 loss = info_nce(o.video_embeds, o.text_video_embeds)
+            # NOTE: audio batches reuse the same loop shape in v2; v1 trains
+            # video<->text alignment (the regression axis). Audio-text pairs
+            # (esc) enter via --epochs mixing in v2 after video converges.
             (loss / args.accum).backward()
             if (i // args.batch + 1) % args.accum == 0:
-                scaler.step(opt)
-                scaler.update()
+                if use_amp:
+                    scaler.step(opt)
+                    scaler.update()
+                else:
+                    opt.step()
                 opt.zero_grad()
             step += 1
+            if step <= start_step:
+                opt.zero_grad()
+                continue
             if step % 20 == 0:
                 print(f"ep{ep} step{step} loss={loss.item():.4f}", flush=True)
+            if step % args.ckpt_every == 0:
+                os.makedirs(args.out + "_ckpt", exist_ok=True)
+                torch.save(model.state_dict(),
+                           os.path.join(args.out + "_ckpt", "model_ckpt.pt"))
+                torch.save(opt.state_dict(),
+                           os.path.join(args.out + "_ckpt", "opt.pt"))
+                open(os.path.join(args.out + "_ckpt", "step.txt"), "w").write(str(step))
     model.save_pretrained(args.out)
     proc.save_pretrained(args.out)
     print("saved", args.out)
