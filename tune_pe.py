@@ -68,6 +68,10 @@ def main():
                     help="default: cuda if available else mps if available else cpu")
     ap.add_argument("--ckpt-every", type=int, default=100,
                     help="save resume checkpoint every N steps (crash-safe)")
+    ap.add_argument("--audio-every", type=int, default=0,
+                    help="every Nth batch is audio<->text (ESC pairs); 0 = video only")
+    ap.add_argument("--amp", action="store_true",
+                    help="autocast-bf16 (proven MPS-safe, cos 0.9999 vs fp32)")
     ap.add_argument("--resume", default=None,
                     help="resume from a step checkpoint dir")
     args = ap.parse_args()
@@ -77,7 +81,7 @@ def main():
     else:
         dev = ("cuda" if torch.cuda.is_available()
                else "mps" if torch.backends.mps.is_available() else "cpu")
-    use_amp = (dev == "cuda")
+    use_amp = (dev == "cuda") or args.amp
     print("device:", dev, "amp:", use_amp, flush=True)
 
     from transformers import AutoModel, AutoProcessor
@@ -101,7 +105,7 @@ def main():
     print(f"trainable {n_train/1e6:.1f}M / frozen {n_frozen/1e6:.1f}M", flush=True)
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
                             lr=args.lr)
-    if use_amp:
+    if dev == "cuda":
         scaler = torch.amp.GradScaler("cuda")
     if args.resume and os.path.exists(os.path.join(args.resume, "opt.pt")):
         # NOTE: raw load_state_dict silently no-ops on PeAudioVideoModel's
@@ -152,27 +156,59 @@ def main():
 
     model.train()
     step = 0
+    n_coco_steps = (len(coco) + args.batch - 1) // args.batch
+    esc_idx = 0
     for ep in range(args.epochs):
         rng = np.random.RandomState(args.seed + ep)
         order = rng.permutation(len(coco))
-        for i in range(0, len(coco), args.batch):
-            chunk = [coco[j] for j in order[i:i + args.batch]]
-            frames = [np.array(Image.open(p).convert("RGB")) for p, _ in chunk]
-            texts = [c for _, c in chunk]
-            pv = proc(videos=[[f] for f in frames],
-                      return_tensors="pt")["pixel_values_videos"]
-            t = proc.tokenizer(texts, return_tensors="pt", padding=True,
-                               truncation=True)
-            aw = proc(audio=[np.zeros(48000, dtype=np.float32)] * len(chunk),
-                      sampling_rate=48000, return_tensors="pt")
-            iv = aw["input_values"]
-            if iv.dim() == 2:
-                iv = iv.unsqueeze(1)
-            inp = {"pixel_values_videos": pv, "input_ids": t["input_ids"],
-                   "attention_mask": t.get("attention_mask"),
-                   "input_values": iv,
-                   "padding_mask": torch.ones((len(chunk), iv.shape[-1]),
-                                              dtype=torch.int32)}
+        for bi in range(n_coco_steps):
+            use_audio = (args.audio_every > 0 and args.n_esc_train > 0
+                         and (bi + 1) % args.audio_every == 0 and esc)
+            if use_audio:
+                chunk = [esc[(esc_idx + j) % len(esc)] for j in range(args.batch)]
+                esc_idx += args.batch
+                ivs = []
+                for w, _ in chunk:
+                    o = proc(audio=w, sampling_rate=48000, return_tensors="pt")
+                    v = o["input_values"]
+                    if v.dim() == 2:
+                        v = v.unsqueeze(1)
+                    ivs.append(v[0, 0])
+                L = max(v.shape[0] for v in ivs)
+                iv = torch.stack([torch.nn.functional.pad(
+                    v, (0, L - v.shape[0])) for v in ivs], dim=0).unsqueeze(1)
+                pm = torch.ones((len(chunk), L), dtype=torch.int32)
+                texts = [c for _, c in chunk]
+                t = proc.tokenizer(texts, return_tensors="pt", padding=True,
+                                   truncation=True)
+                fr = np.full((1, 336, 336, 3), 128, dtype=np.uint8)
+                pv = proc(videos=[fr] * len(chunk),
+                          return_tensors="pt")["pixel_values_videos"]
+                inp = {"input_values": iv, "padding_mask": pm,
+                       "input_ids": t["input_ids"],
+                       "attention_mask": t.get("attention_mask"),
+                       "pixel_values_videos": pv}
+                is_audio = True
+            else:
+                i = bi * args.batch
+                chunk = [coco[j] for j in order[i:i + args.batch]]
+                frames = [np.array(Image.open(p).convert("RGB"))
+                          for p, _ in chunk]
+                texts = [c for _, c in chunk]
+                pv = proc(videos=[[f] for f in frames],
+                          return_tensors="pt")["pixel_values_videos"]
+                t = proc.tokenizer(texts, return_tensors="pt", padding=True,
+                                   truncation=True)
+                aw = proc(audio=[np.zeros(48000, dtype=np.float32)] * len(chunk),
+                          sampling_rate=48000, return_tensors="pt")
+                iv = aw["input_values"]
+                if iv.dim() == 2:
+                    iv = iv.unsqueeze(1)
+                inp = {"pixel_values_videos": pv, "input_ids": t["input_ids"],
+                       "attention_mask": t.get("attention_mask"),
+                       "input_values": iv,
+                       "padding_mask": torch.ones((len(chunk), iv.shape[-1]),
+                                                  dtype=torch.int32)}
             inp = {k: (v.to(dev) if hasattr(v, "to") else v)
                    for k, v in inp.items()}
             with torch.autocast(dev, dtype=torch.bfloat16,
@@ -181,13 +217,16 @@ def main():
                               if k in ("input_ids", "attention_mask",
                                        "pixel_values_videos", "input_values",
                                        "padding_mask")})
-                loss = info_nce(o.video_embeds, o.text_video_embeds)
+                loss = (info_nce(o.audio_embeds, o.text_audio_embeds)
+                        if use_audio else
+                        info_nce(o.video_embeds, o.text_video_embeds))
             # NOTE: audio batches reuse the same loop shape in v2; v1 trains
             # video<->text alignment (the regression axis). Audio-text pairs
             # (esc) enter via --epochs mixing in v2 after video converges.
             (loss / args.accum).backward()
-            if (i // args.batch + 1) % args.accum == 0:
-                if use_amp:
+            n_done = bi + 1 + ep * n_coco_steps
+            if n_done % args.accum == 0:
+                if dev == "cuda" and use_amp:
                     scaler.step(opt)
                     scaler.update()
                 else:
