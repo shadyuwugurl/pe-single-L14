@@ -128,22 +128,49 @@ def main():
     coco = download_coco_train(args.n_coco_train)
 
     from datasets import load_dataset
-    esc_all = load_dataset("ashraq/esc50", split="train", streaming=True)
+    esc_cache_npy = "../tune_data/esc1600.npy"
+    esc_cache_lab = "../tune_data/esc1600_labels.json"
     esc = []
-    for ex in esc_all:
-        if int(ex["fold"]) == 5:
-            continue  # hold out fold 5 for eval
-        s = ex["audio"].get_all_samples()
-        arr = np.asarray(s.data, dtype=np.float32)
-        if arr.ndim > 1:
-            arr = arr.mean(axis=0)
-        t = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).float()
-        r = torch.nn.functional.interpolate(
-            t, size=int(round(len(arr) * 48000 / 44100)),
-            mode="linear", align_corners=False)
-        esc.append((r[0, 0].numpy(), f"the sound of {ex['category']}"))
-        if len(esc) >= args.n_esc_train:
-            break
+    if os.path.exists(esc_cache_npy) and os.path.exists(esc_cache_lab):
+        _cm = np.load(esc_cache_npy, mmap_mode="r")
+        _labels = json.load(open(esc_cache_lab))
+        for c, e in zip(_cm, _labels):
+            cat = e["cat"] if isinstance(e, dict) else str(e)
+            fold = e.get("fold", 1) if isinstance(e, dict) else 1
+            if fold == 5:
+                continue
+            esc.append((np.asarray(c, dtype=np.float32),
+                        f"the sound of {cat}"))
+        esc = esc[:args.n_esc_train]
+        print(f"esc train pairs: {len(esc)} (disk cache, mmap)", flush=True)
+    else:
+        esc_all = load_dataset("ashraq/esc50", split="train", streaming=True)
+        _cc, _ll = [], []
+        for ex in esc_all:
+            s = ex["audio"].get_all_samples()
+            arr = np.asarray(s.data, dtype=np.float32)
+            if arr.ndim > 1:
+                arr = arr.mean(axis=0)
+            t = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).float()
+            r = torch.nn.functional.interpolate(
+                t, size=int(round(len(arr) * 48000 / 44100)),
+                mode="linear", align_corners=False)
+            clip = r[0, 0].numpy()
+            _cc.append(clip)
+            _ll.append({"cat": ex["category"], "fold": int(ex["fold"])})
+            if int(ex["fold"]) != 5:
+                esc.append((clip, f"the sound of {ex['category']}"))
+            if len(_cc) >= 2000:
+                break
+        os.makedirs("../tune_data", exist_ok=True)
+        L = max(len(c) for c in _cc)
+        _mat = np.zeros((len(_cc), L), dtype=np.float32)
+        for i, c in enumerate(_cc):
+            _mat[i, :len(c)] = c
+        np.save(esc_cache_npy, _mat)  # plain fast write, mmap-readable
+        json.dump(_ll, open(esc_cache_lab, "w"))
+        esc = esc[:args.n_esc_train]
+        print(f"esc train pairs: {len(esc)} (fold 5 held out, cached)", flush=True)
     print(f"esc train pairs: {len(esc)} (fold 5 held out)", flush=True)
 
     def info_nce(a, b):

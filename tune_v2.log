@@ -1,0 +1,10 @@
+device: mps amp: True
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+[ERROR] `padding_mask_videos` is part of PeVideoModel.__init__.<locals>.get_video_features's signature, but not documented. Make sure to add it to the docstring of the function in /opt/homebrew/lib/python3.14/site-packages/transformers/models/pe_video/modeling_pe_video.py.
+Loading weights:   0%|          | 0/903 [00:00<?, ?it/s]Loading weights:  58%|█████▊    | 527/903 [00:00<00:00, 5236.35it/s]Loading weights: 100%|██████████| 903/903 [00:00<00:00, 5471.94it/s]
+trainable 392.6M / frozen 641.1M
+resumed at step 50
+coco train pairs: 4000
+Repo card metadata block was not found. Setting CardData to empty.
+esc train pairs: 1600 (fold 5 held out, cached)
+esc train pairs: 1600 (fold 5 held out)
